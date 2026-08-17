@@ -212,13 +212,29 @@ static NSString *kPlistPacketTypeConnect = @"Connect";
     if (onStart) onStart(nil);
     return;
   }
-  channel_ = [PTUSBChannel new];
+  PTUSBChannel *channel = [PTUSBChannel new];
+  channel_ = channel;
   NSError *error = nil;
-  if ([channel_ openOnQueue:queue error:&error onEnd:onEnd]) {
-    [channel_ listenWithBroadcastHandler:^(NSDictionary *packet) { [self handleBroadcastPacket:packet]; } callback:onStart];
-  } else if (onStart) {
-    onStart(error);
+  if ([channel openOnQueue:queue error:&error onEnd:^(NSError *endError) {
+    if (self->channel_ == channel) {
+      self->channel_ = nil;
+    }
+    if (onEnd) {
+      onEnd(endError);
+    }
+  }]) {
+    [channel listenWithBroadcastHandler:^(NSDictionary *packet) { [self handleBroadcastPacket:packet]; } callback:onStart];
+  } else {
+    channel_ = nil;
+    if (onStart) {
+      onStart(error);
+    }
   }
+}
+
+
+- (void)stopListening {
+  [channel_ stop];
 }
 
 
@@ -444,6 +460,20 @@ static NSString *kPlistPacketTypeConnect = @"Connect";
   assert(isReadingPackets_ == NO);
   
   [self scheduleReadPacketWithCallback:^(NSError *error, NSDictionary *packet, uint32_t packetTag) {
+    if (error) {
+      self->autoReadPackets_ = NO;
+      self->isReadingPackets_ = NO;
+
+      NSArray *requestCallbacks = [self->responseQueue_ allValues];
+      [self->responseQueue_ removeAllObjects];
+      for (void(^requestCallback)(NSError*, NSDictionary*) in requestCallbacks) {
+        requestCallback(error, nil);
+      }
+
+      [self stop];
+      return;
+    }
+
     // Interpret the package we just received
     if (packetTag == 0) {
       // Broadcast message
@@ -488,12 +518,52 @@ static NSString *kPlistPacketTypeConnect = @"Connect";
     char *buffer = NULL;
     size_t buffer_size = 0;
     PT_PRECISE_LIFETIME_UNUSED dispatch_data_t map_data = dispatch_data_create_map(data, (const void **)&buffer, &buffer_size); // objc_precise_lifetime guarantees 'map_data' isn't released before memcpy has a chance to do its thing
-    assert(buffer_size == sizeof(ref_upacket.size));
+    if (buffer_size != sizeof(ref_upacket.size)) {
+      self->isReadingPackets_ = NO;
+      callback(
+        [[NSError alloc] initWithDomain:PTUSBHubErrorDomain code:PTUSBHubErrorTruncatedPacketHeader userInfo:@{
+          NSLocalizedDescriptionKey: @"Received a truncated usbmux packet header",
+          @"ExpectedLength": @(sizeof(ref_upacket.size)),
+          @"ActualLength": @(buffer_size)
+        }],
+        nil,
+        0
+      );
+      return;
+    }
     assert(sizeof(upacket_len) == sizeof(ref_upacket.size));
     memcpy((void *)&(upacket_len), (const void *)buffer, buffer_size);
 
-    // Allocate a new usbmux_packet_t for the expected size
+    if (upacket_len < sizeof(usbmux_packet_t)) {
+      self->isReadingPackets_ = NO;
+      callback(
+        [[NSError alloc] initWithDomain:PTUSBHubErrorDomain code:PTUSBHubErrorInvalidPacketSize userInfo:@{
+          NSLocalizedDescriptionKey: @"Received an invalid usbmux packet size",
+          @"PacketLength": @(upacket_len),
+          @"MinimumLength": @(sizeof(usbmux_packet_t))
+        }],
+        nil,
+        0
+      );
+      return;
+    }
+
     uint32_t payloadLength = upacket_len - (uint32_t)sizeof(usbmux_packet_t);
+    if (payloadLength > kUsbmuxPacketMaxPayloadSize) {
+      self->isReadingPackets_ = NO;
+      callback(
+        [[NSError alloc] initWithDomain:PTUSBHubErrorDomain code:PTUSBHubErrorPacketTooLarge userInfo:@{
+          NSLocalizedDescriptionKey: @"Received a packet that is too large",
+          @"PayloadLength": @(payloadLength),
+          @"MaximumPayloadLength": @(kUsbmuxPacketMaxPayloadSize)
+        }],
+        nil,
+        0
+      );
+      return;
+    }
+
+    // Allocate a new usbmux_packet_t for the expected size
     usbmux_packet_t *upacket = usbmux_packet_alloc(payloadLength);
     
     // Read rest of the incoming usbmux_packet_t
@@ -513,22 +583,23 @@ static NSString *kPlistPacketTypeConnect = @"Connect";
         return;
       }
 
-      if (upacket_len > kUsbmuxPacketMaxPayloadSize) {
+      // Copy read bytes onto our usbmux_packet_t
+      char *buffer = NULL;
+      size_t buffer_size = 0;
+      PT_PRECISE_LIFETIME_UNUSED dispatch_data_t map_data = dispatch_data_create_map(data, (const void **)&buffer, &buffer_size);
+      if (buffer_size != upacket->size - offset) {
         callback(
-          [[NSError alloc] initWithDomain:PTUSBHubErrorDomain code:1 userInfo:@{
-            NSLocalizedDescriptionKey:@"Received a packet that is too large"}],
+          [[NSError alloc] initWithDomain:PTUSBHubErrorDomain code:PTUSBHubErrorTruncatedPacketBody userInfo:@{
+            NSLocalizedDescriptionKey: @"Received a truncated usbmux packet body",
+            @"ExpectedLength": @(upacket->size - offset),
+            @"ActualLength": @(buffer_size)
+          }],
           nil,
           0
         );
         usbmux_packet_free(upacket);
         return;
       }
-      
-      // Copy read bytes onto our usbmux_packet_t
-      char *buffer = NULL;
-      size_t buffer_size = 0;
-      PT_PRECISE_LIFETIME_UNUSED dispatch_data_t map_data = dispatch_data_create_map(data, (const void **)&buffer, &buffer_size);
-      assert(buffer_size == upacket->size - offset);
       memcpy(((void *)(upacket))+offset, (const void *)buffer, buffer_size);
 
       // We only support plist protocol

@@ -1,6 +1,8 @@
 #include <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 // PTUSBDeviceDidAttachNotification
 // Posted when a device has been attached. Also posted for each device that is
 // already attached when the PTUSBHub starts listening.
@@ -42,6 +44,10 @@ FOUNDATION_EXPORT NSString * const PTUSBHubErrorDomain;
 typedef enum {
   PTUSBHubErrorBadDevice = 2,
   PTUSBHubErrorConnectionRefused = 3,
+  PTUSBHubErrorPacketTooLarge = 100,
+  PTUSBHubErrorTruncatedPacketHeader = 101,
+  PTUSBHubErrorInvalidPacketSize = 102,
+  PTUSBHubErrorTruncatedPacketBody = 103,
 } PTUSBHubError;
 
 @interface PTUSBHub : NSObject
@@ -49,7 +55,9 @@ typedef enum {
 // Shared, implicitly opened hub.
 + (instancetype)sharedHub;
 
-- (instancetype)init NS_UNAVAILABLE;
+// Creates a hub whose listening lifecycle is managed explicitly through
+// listenOnQueue:onStart:onEnd: and stopListening.
+- (instancetype)init;
 
 // Connect to a TCP *port* on a device, while the actual transport is over USB.
 // Upon success, *error* is nil and *channel* is a duplex I/O channel.
@@ -68,8 +76,8 @@ typedef enum {
 //
 - (void)connectToDevice:(NSNumber*)deviceID
                    port:(int)port
-                onStart:(void(^)(NSError *error, dispatch_io_t channel))onStart
-                  onEnd:(void(^)(NSError *error))onEnd;
+                onStart:(void(^)(NSError * _Nullable error, dispatch_io_t _Nullable channel))onStart
+                  onEnd:(void(^ _Nullable)(NSError * _Nullable error))onEnd;
 
 // Start listening for devices. You only need to invoke this method on custom
 // instances to start receiving notifications. The shared instance returned from
@@ -83,7 +91,13 @@ typedef enum {
 // listening stopped because of an error. Pass NULL for no callback.
 //
 - (void)listenOnQueue:(dispatch_queue_t)queue
-              onStart:(void(^)(NSError*))onStart
-                onEnd:(void(^)(NSError*))onEnd;
+              onStart:(void(^ _Nullable)(NSError * _Nullable))onStart
+                onEnd:(void(^ _Nullable)(NSError * _Nullable))onEnd;
+
+// Stops listening for device changes. A stopped hub can be discarded and
+// replaced with a newly initialized instance.
+- (void)stopListening;
 
 @end
+
+NS_ASSUME_NONNULL_END
